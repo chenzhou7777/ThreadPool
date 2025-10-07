@@ -1,98 +1,131 @@
+// ThreadPool.h
+// 线程池实现：支持任务异步提交与多线程并发执行
 #ifndef THREAD_POOL_H
 #define THREAD_POOL_H
 
-#include <vector>
-#include <queue>
-#include <memory>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <future>
-#include <functional>
-#include <stdexcept>
+#include <condition_variable> // 条件变量用于线程同步
+#include <functional>         // std::function 用于任务封装
+#include <future>    // std::future/std::packaged_task 用于异步结果
+#include <memory>    // 智能指针
+#include <mutex>     // 互斥锁
+#include <queue>     // 任务队列
+#include <stdexcept> // 异常处理
+#include <thread>    // 线程
+#include <vector>    // 线程容器
 
+// 线程池类：用于管理和调度多个工作线程执行任务
 class ThreadPool {
 public:
-    ThreadPool(size_t);
-    template<class F, class... Args>
-    auto enqueue(F&& f, Args&&... args) 
-        -> std::future<typename std::result_of<F(Args...)>::type>;
-    ~ThreadPool();
+  /**
+   * 构造函数
+   * @param threads 工作线程数量，必须大于0
+   * 创建指定数量的工作线程，等待任务到来
+   */
+  explicit ThreadPool(size_t threads);
+
+  /**
+   * 向线程池提交任务
+   * @tparam F 可调用对象类型
+   * @tparam Args 参数类型
+   * @param f 任务函数
+   * @param args 任务参数
+   * @return std::future<返回值类型>，可用于获取任务结果
+   * 任务会被封装并异步执行
+   */
+  template <class F, class... Args>
+  auto enqueue(F &&f, Args &&...args)
+      -> std::future<typename std::invoke_result_t<F, Args...>>;
+
+  /**
+   * 析构函数
+   * 停止所有线程并回收资源
+   */
+  ~ThreadPool();
+
 private:
-    // need to keep track of threads so we can join them
-    std::vector< std::thread > workers;
-    // the task queue
-    std::queue< std::function<void()> > tasks;
-    
-    // synchronization
-    std::mutex queue_mutex;
-    std::condition_variable condition;
-    bool stop;
+  std::vector<std::thread> workers;        // 工作线程容器
+  std::queue<std::function<void()>> tasks; // 任务队列，存储待执行任务
+  std::mutex queue_mutex;                  // 任务队列互斥锁
+  std::condition_variable condition;       // 条件变量用于任务通知
+  bool stop = false;                       // 线程池停止标志
 };
- 
-// the constructor just launches some amount of workers
-inline ThreadPool::ThreadPool(size_t threads)
-    :   stop(false)
-{
-    for(size_t i = 0;i<threads;++i)
-        workers.emplace_back(
-            [this]
-            {
-                for(;;)
-                {
-                    std::function<void()> task;
 
-                    {
-                        std::unique_lock<std::mutex> lock(this->queue_mutex);
-                        this->condition.wait(lock,
-                            [this]{ return this->stop || !this->tasks.empty(); });
-                        if(this->stop && this->tasks.empty())
-                            return;
-                        task = std::move(this->tasks.front());
-                        this->tasks.pop();
-                    }
-
-                    task();
-                }
-            }
-        );
+/**
+ * 构造函数实现
+ * 创建指定数量的工作线程，每个线程循环等待任务队列有新任务
+ * 线程安全：通过互斥锁和条件变量同步
+ */
+inline ThreadPool::ThreadPool(size_t threads) {
+  if (threads == 0) {
+    throw std::invalid_argument("ThreadPool size must be greater than 0");
+  }
+  for (size_t i = 0; i < threads; ++i)
+    workers.emplace_back([this] {
+      for (;;) {
+        std::function<void()> task;
+        {
+          // 加锁保护任务队列
+          std::unique_lock<std::mutex> lock(this->queue_mutex);
+          // 等待任务到来或线程池停止
+          this->condition.wait(
+              lock, [this] { return this->stop || !this->tasks.empty(); });
+          // 如果线程池停止且队列为空，则退出线程
+          if (this->stop && this->tasks.empty())
+            return;
+          // 取出一个任务
+          task = std::move(this->tasks.front());
+          this->tasks.pop();
+        }
+        // 执行任务
+        task();
+      }
+    });
 }
 
-// add new work item to the pool
-template<class F, class... Args>
-auto ThreadPool::enqueue(F&& f, Args&&... args) 
-    -> std::future<typename std::result_of<F(Args...)>::type>
-{
-    using return_type = typename std::result_of<F(Args...)>::type;
-
-    auto task = std::make_shared< std::packaged_task<return_type()> >(
-            std::bind(std::forward<F>(f), std::forward<Args>(args)...)
-        );
-        
-    std::future<return_type> res = task->get_future();
-    {
-        std::unique_lock<std::mutex> lock(queue_mutex);
-
-        // don't allow enqueueing after stopping the pool
-        if(stop)
-            throw std::runtime_error("enqueue on stopped ThreadPool");
-
-        tasks.emplace([task](){ (*task)(); });
-    }
-    condition.notify_one();
-    return res;
+/**
+ * 向线程池提交任务
+ * 任务会被封装为 std::packaged_task，支持返回值和异常传递
+ * 线程安全：加锁保护任务队列
+ */
+template <class F, class... Args>
+auto ThreadPool::enqueue(F &&f, Args &&...args)
+    -> std::future<typename std::invoke_result_t<F, Args...>> {
+  using return_type = typename std::invoke_result_t<F, Args...>;
+  // 将任务和参数绑定，封装为可异步执行的 packaged_task
+  auto task = std::make_shared<std::packaged_task<return_type()>>(
+      std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+  std::future<return_type> res = task->get_future(); // 获取任务结果 future
+  {
+    std::unique_lock<std::mutex> lock(queue_mutex); // 加锁保护队列
+    if (stop)
+      throw std::runtime_error(
+          "enqueue on stopped ThreadPool"); // 停止后不允许提交
+    // 将任务加入队列，等待线程执行
+    tasks.emplace([task = std::move(task)]() { (*task)(); });
+  }
+  condition.notify_one(); // 通知一个工作线程
+  return res;
 }
 
-// the destructor joins all threads
-inline ThreadPool::~ThreadPool()
-{
-    {
-        std::unique_lock<std::mutex> lock(queue_mutex);
-        stop = true;
+/**
+ * 析构函数实现
+ * 停止所有线程，等待所有任务完成并回收资源
+ * 线程安全：加锁设置停止标志，通知所有线程
+ */
+inline ThreadPool::~ThreadPool() {
+  {
+    std::unique_lock<std::mutex> lock(queue_mutex);
+    stop = true; // 设置停止标志
+  }
+  condition.notify_all(); // 唤醒所有线程
+  for (std::thread &worker : workers) {
+    try {
+      if (worker.joinable())
+        worker.join(); // 等待线程结束
+    } catch (...) {
+      // 析构中不能抛异常，忽略异常
     }
-    condition.notify_all();
-    for(std::thread &worker: workers)
-        worker.join();
+  }
 }
 
 #endif
